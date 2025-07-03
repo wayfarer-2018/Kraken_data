@@ -9,6 +9,10 @@ jobs:
   update-data:
     runs-on: ubuntu-latest
 
+    # This block grants the workflow permission to write to the repository.
+    permissions:
+      contents: write
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v3
