@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import json
 from datetime import datetime
+import os
 
 # --- CONFIGURATION ---
 CSV_URL = 'https://raw.githubusercontent.com/wayfarer-2018/Kraken_data/main/kraken_usd_pairs_close_history.csv'
@@ -65,47 +66,51 @@ def load_and_clean_data(url):
     
     return price_df
 
-def calculate_rrg(price_df):
-    """Calculates RRG data for the entire history using the Dynamic Universe approach."""
+def calculate_rrg(price_df, start_date=None):
+    """Calculates RRG data using the Dynamic Universe approach, starting from a specific date."""
     all_dates = price_df.index
     rrg_snapshots = {}
+    
+    # Determine the starting index for the calculation loop
+    start_index = MIN_HISTORY_REQUIRED
+    if start_date:
+        # Find the index of the date after the last processed date
+        try:
+            start_index = all_dates.get_loc(start_date) + 1
+        except KeyError:
+            print(f"Warning: Last processed date {start_date} not found. Performing full recalculation.")
+            start_index = MIN_HISTORY_REQUIRED
 
-    for i in range(MIN_HISTORY_REQUIRED, len(all_dates)):
+    print(f"Starting calculation from index {start_index}...")
+
+    for i in range(start_index, len(all_dates)):
         current_date = all_dates[i]
-        start_date = all_dates[i - MIN_HISTORY_REQUIRED]
+        history_start_date = all_dates[i - MIN_HISTORY_REQUIRED]
         
-        # 1. Determine the valid universe for this date
-        # An asset is valid if it has no missing data in the lookback window
-        historical_window = price_df[start_date:current_date]
+        # 1. Determine the valid universe for this specific day
+        historical_window = price_df[history_start_date:current_date]
         valid_assets = historical_window.dropna(axis=1).columns
         
         if len(valid_assets) < 2:
             continue
 
         # 2. Calculate the dynamic benchmark for this day's universe
-        benchmark = price_df.loc[start_date:current_date, valid_assets].mean(axis=1)
+        benchmark = price_df.loc[history_start_date:current_date, valid_assets].mean(axis=1)
         
         daily_data = {}
         
         # 3. Calculate RRG for each asset in the valid universe
         for asset in valid_assets:
-            # Calculate Relative Strength
-            rs = price_df.loc[start_date:current_date, asset] / benchmark
-            
-            # Calculate RS-Ratio (SMA of Relative Strength)
+            rs = price_df.loc[history_start_date:current_date, asset] / benchmark
             rs_ratio_series = rs.rolling(window=RRG_LOOKBACK).mean()
             
-            # Normalize RS-Ratio
             mean_rs_ratio = rs_ratio_series.mean()
             std_rs_ratio = rs_ratio_series.std()
             if std_rs_ratio == 0: continue
             
             normalized_rs_ratio = 100 + ((rs_ratio_series - mean_rs_ratio) / std_rs_ratio) * 10
-            
-            # Calculate RS-Momentum (Rate of Change of Normalized RS-Ratio)
             rs_momentum_series = (normalized_rs_ratio / normalized_rs_ratio.shift(RRG_LOOKBACK) - 1) * 100 + 100
             
-            # Get the latest values for the current date
             current_ratio = normalized_rs_ratio.iloc[-1]
             current_momentum = rs_momentum_series.iloc[-1]
 
@@ -115,8 +120,6 @@ def calculate_rrg(price_df):
                     'y': round(current_momentum, 2)
                 }
         
-        # Store the snapshot for the current date
-        # Format date as YYYY-MM-DD for JSON key
         date_str = current_date.strftime('%Y-%m-%d')
         rrg_snapshots[date_str] = daily_data
 
@@ -127,19 +130,40 @@ def main():
     print("Loading and cleaning data...")
     price_df = load_and_clean_data(CSV_URL)
     
-    print("Calculating RRG snapshots for all dates (this may take a moment)...")
-    rrg_data = calculate_rrg(price_df)
+    existing_data = {}
+    last_processed_date = None
     
-    # Prepare final JSON object
-    final_output = {
-        "assets": [
-            {"symbol": symbol, "category": CATEGORY_MAP.get(symbol, "Other")} 
-            for symbol in price_df.columns if CATEGORY_MAP.get(symbol, "Other") != "Other"
-        ],
-        "rrg_history": rrg_data
-    }
+    if os.path.exists(OUTPUT_JSON_PATH):
+        print(f"Found existing data file: {OUTPUT_JSON_PATH}")
+        with open(OUTPUT_JSON_PATH, 'r') as f:
+            existing_data = json.load(f)
+        if existing_data.get("rrg_history"):
+            last_processed_date = sorted(existing_data["rrg_history"].keys())[-1]
+            print(f"Last processed date: {last_processed_date}")
 
-    print(f"Saving data to {OUTPUT_JSON_PATH}...")
+    print("Calculating new RRG snapshots...")
+    new_snapshots = calculate_rrg(price_df, start_date=last_processed_date)
+    
+    if not new_snapshots:
+        print("No new data to process. Exiting.")
+        return
+
+    # Prepare final JSON object
+    if not existing_data:
+         final_output = {
+            "assets": [
+                {"symbol": symbol, "category": CATEGORY_MAP.get(symbol, "Other")} 
+                for symbol in price_df.columns if CATEGORY_MAP.get(symbol, "Other") != "Other"
+            ],
+            "rrg_history": new_snapshots
+        }
+    else:
+        # Update existing data with new snapshots
+        existing_data["rrg_history"].update(new_snapshots)
+        final_output = existing_data
+
+
+    print(f"Saving updated data to {OUTPUT_JSON_PATH}...")
     with open(OUTPUT_JSON_PATH, 'w') as f:
         json.dump(final_output, f)
         
