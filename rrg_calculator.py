@@ -8,9 +8,10 @@ import os
 CSV_URL = 'https://raw.githubusercontent.com/wayfarer-2018/Kraken_data/main/kraken_usd_pairs_close_history.csv'
 OUTPUT_JSON_PATH = 'rrg_data.json'
 RRG_LOOKBACK = 10
-MIN_HISTORY_REQUIRED = RRG_LOOKBACK * 2 # Minimum data points needed to start calculation
+HOOK_LOOKBACK_PERIOD = 12
+MIN_HISTORY_REQUIRED = RRG_LOOKBACK * 2 
 
-# --- ALIASES AND CATEGORIES (Should match the dashboard's config) ---
+# --- ALIASES AND CATEGORIES ---
 TICKER_ALIAS_MAP = {
     'XBT': 'BTC', 'XDG': 'DOGE', 'XXRP': 'XRP', 'XXLM': 'XLM',
     'XETC': 'ETC', 'XETH': 'ETH', 'XLTC': 'LTC', 'XMLN': 'MLN',
@@ -54,54 +55,53 @@ def load_and_clean_data(url):
     df = pd.read_csv(url)
     df['date'] = pd.to_datetime(df['date'])
     
-    # Clean and normalize the 'pair' column
     df['symbol'] = df['pair'].str.replace(r'ZUSD|USD|USDT|BUSD|BTC$', '', regex=True).str.upper()
     df['symbol'] = df['symbol'].replace(TICKER_ALIAS_MAP)
     
-    # Pivot the table to have dates as index and symbols as columns
     price_df = df.pivot_table(index='date', columns='symbol', values='close', aggfunc='first')
-    
-    # Forward-fill missing values to handle gaps
     price_df.ffill(inplace=True)
     
     return price_df
 
-def calculate_rrg(price_df, start_date=None):
-    """Calculates RRG data using the Dynamic Universe approach, starting from a specific date."""
+def get_signal(point, is_hook=False):
+    """Determines the signal based on RRG coordinates."""
+    if is_hook:
+        return 'HOOK'
+    if point['x'] > 100 and point['y'] > 100:
+        return 'HOLD'
+    if point['x'] < 100 and point['y'] > 100:
+        return 'BUY'
+    return 'SELL'
+
+def calculate_rrg_and_signals(price_df, start_date=None):
+    """Calculates RRG data and signals for the entire history using the Dynamic Universe approach."""
     all_dates = price_df.index
-    rrg_snapshots = {}
     
-    # Determine the starting index for the calculation loop
+    # Create a DataFrame to hold all RRG data points (x, y) for all assets
+    rrg_df = pd.DataFrame(index=all_dates, columns=pd.MultiIndex.from_product([price_df.columns, ['x', 'y']]))
+
     start_index = MIN_HISTORY_REQUIRED
     if start_date:
-        # Find the index of the date after the last processed date
         try:
             start_index = all_dates.get_loc(start_date) + 1
         except KeyError:
-            print(f"Warning: Last processed date {start_date} not found. Performing full recalculation.")
             start_index = MIN_HISTORY_REQUIRED
 
-    print(f"Starting calculation from index {start_index}...")
+    print(f"Starting RRG calculation from index {start_index}...")
 
     for i in range(start_index, len(all_dates)):
         current_date = all_dates[i]
         history_start_date = all_dates[i - MIN_HISTORY_REQUIRED]
         
-        # 1. Determine the valid universe for this specific day
-        historical_window = price_df[history_start_date:current_date]
+        historical_window = price_df.loc[history_start_date:current_date]
         valid_assets = historical_window.dropna(axis=1).columns
         
-        if len(valid_assets) < 2:
-            continue
+        if len(valid_assets) < 2: continue
 
-        # 2. Calculate the dynamic benchmark for this day's universe
-        benchmark = price_df.loc[history_start_date:current_date, valid_assets].mean(axis=1)
+        benchmark = historical_window[valid_assets].mean(axis=1)
         
-        daily_data = {}
-        
-        # 3. Calculate RRG for each asset in the valid universe
         for asset in valid_assets:
-            rs = price_df.loc[history_start_date:current_date, asset] / benchmark
+            rs = historical_window[asset] / benchmark
             rs_ratio_series = rs.rolling(window=RRG_LOOKBACK).mean()
             
             mean_rs_ratio = rs_ratio_series.mean()
@@ -115,15 +115,42 @@ def calculate_rrg(price_df, start_date=None):
             current_momentum = rs_momentum_series.iloc[-1]
 
             if not np.isnan(current_ratio) and not np.isnan(current_momentum):
-                daily_data[asset] = {
-                    'x': round(current_ratio, 2),
-                    'y': round(current_momentum, 2)
-                }
-        
-        date_str = current_date.strftime('%Y-%m-%d')
-        rrg_snapshots[date_str] = daily_data
+                rrg_df.loc[current_date, (asset, 'x')] = current_ratio
+                rrg_df.loc[current_date, (asset, 'y')] = current_momentum
 
-    return rrg_snapshots
+    # Calculate signals for all points
+    signals_df = pd.DataFrame(index=rrg_df.index, columns=price_df.columns)
+    for asset in rrg_df.columns.get_level_values(0).unique():
+        asset_df = rrg_df[asset].dropna()
+        if asset_df.empty: continue
+
+        # Hook Signal Calculation
+        lookback_data = asset_df.rolling(window=HOOK_LOOKBACK_PERIOD + 1).apply(lambda w: w.to_dict(), raw=False)
+        is_hook = lookback_data.apply(lambda w: 
+            w[-1]['x'] > 100 and w[-1]['y'] > 100 and # Condition 3
+            w[0]['x'] > 100 and w[0]['y'] > 100 and # Condition 1
+            any(p['x'] > 100 and p['y'] < 100 for p in w[1:-1]) and # Condition 2
+            w[-1]['y'] > w[0]['y'] and w[-1]['x'] > w[0]['x'] # Condition 4 & 5
+            if isinstance(w, list) and len(w) == HOOK_LOOKBACK_PERIOD + 1 else False
+        )
+
+        for date, point in asset_df.iterrows():
+            signals_df.loc[date, asset] = get_signal(point, is_hook=is_hook.get(date, False))
+
+    return rrg_df, signals_df
+
+def calculate_market_breadth(signals_df):
+    """Calculates the Net Breadth Oscillator and its EMAs."""
+    buy_signals = (signals_df == 'BUY').sum(axis=1)
+    sell_signals = (signals_df == 'SELL').sum(axis=1)
+    net_breadth = buy_signals - sell_signals
+    
+    breadth_df = pd.DataFrame(index=signals_df.index)
+    breadth_df['net'] = net_breadth
+    breadth_df['fast_ema'] = net_breadth.ewm(span=9, adjust=False).mean()
+    breadth_df['slow_ema'] = net_breadth.ewm(span=21, adjust=False).mean()
+    
+    return breadth_df
 
 def main():
     """Main function to run the script."""
@@ -141,9 +168,34 @@ def main():
             last_processed_date = sorted(existing_data["rrg_history"].keys())[-1]
             print(f"Last processed date: {last_processed_date}")
 
-    print("Calculating new RRG snapshots...")
-    new_snapshots = calculate_rrg(price_df, start_date=last_processed_date)
-    
+    print("Calculating RRG and signals...")
+    rrg_df, signals_df = calculate_rrg_and_signals(price_df, start_date=last_processed_date)
+
+    print("Calculating market breadth...")
+    breadth_df = calculate_market_breadth(signals_df)
+
+    # Convert DataFrames to JSON-friendly format
+    new_snapshots = {}
+    for date, row in rrg_df.iterrows():
+        date_str = date.strftime('%Y-%m-%d')
+        daily_data = {}
+        for asset in row.index.get_level_values(0).unique():
+            if not pd.isna(row[(asset, 'x')]):
+                daily_data[asset] = {
+                    'x': round(row[(asset, 'x')], 2),
+                    'y': round(row[(asset, 'y')], 2),
+                    'signal': signals_df.loc[date, asset]
+                }
+        if daily_data:
+            new_snapshots[date_str] = daily_data
+
+    breadth_history = {
+        date.strftime('%Y-%m-%d'): {
+            'fast_ema': round(row['fast_ema'], 2),
+            'slow_ema': round(row['slow_ema'], 2)
+        } for date, row in breadth_df.dropna().iterrows()
+    }
+
     if not new_snapshots:
         print("No new data to process. Exiting.")
         return
@@ -155,13 +207,13 @@ def main():
                 {"symbol": symbol, "category": CATEGORY_MAP.get(symbol, "Other")} 
                 for symbol in price_df.columns if CATEGORY_MAP.get(symbol, "Other") != "Other"
             ],
-            "rrg_history": new_snapshots
+            "rrg_history": new_snapshots,
+            "market_breadth": breadth_history
         }
     else:
-        # Update existing data with new snapshots
         existing_data["rrg_history"].update(new_snapshots)
+        existing_data["market_breadth"] = breadth_history # Overwrite with full history for simplicity
         final_output = existing_data
-
 
     print(f"Saving updated data to {OUTPUT_JSON_PATH}...")
     with open(OUTPUT_JSON_PATH, 'w') as f:
