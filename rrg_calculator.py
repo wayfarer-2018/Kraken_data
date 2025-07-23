@@ -65,12 +65,9 @@ def load_and_clean_data(url):
 
 def get_signal(point, is_hook=False):
     """Determines the signal based on RRG coordinates."""
-    if is_hook:
-        return 'HOOK'
-    if point['x'] > 100 and point['y'] > 100:
-        return 'HOLD'
-    if point['x'] < 100 and point['y'] > 100:
-        return 'BUY'
+    if is_hook: return 'HOOK'
+    if point['x'] > 100 and point['y'] > 100: return 'HOLD'
+    if point['x'] < 100 and point['y'] > 100: return 'BUY'
     return 'SELL'
 
 def calculate_rrg_and_signals(price_df, start_date=None):
@@ -101,17 +98,25 @@ def calculate_rrg_and_signals(price_df, start_date=None):
         
         for asset in valid_assets:
             rs = historical_window[asset] / benchmark
-            rs_ratio_series = rs.rolling(window=RRG_LOOKBACK).mean()
             
+            # CORRECTED LOGIC: Calculate Ratio and Momentum from raw RS
+            rs_ratio_series = rs.rolling(window=RRG_LOOKBACK).mean()
+            rs_momentum_series = (rs / rs.shift(RRG_LOOKBACK) - 1) * 100
+            
+            # Normalize both series independently
             mean_rs_ratio = rs_ratio_series.mean()
             std_rs_ratio = rs_ratio_series.std()
             if std_rs_ratio == 0: continue
-            
+
+            mean_rs_mom = rs_momentum_series.mean()
+            std_rs_mom = rs_momentum_series.std()
+            if std_rs_mom == 0: continue
+
             normalized_rs_ratio = 100 + ((rs_ratio_series - mean_rs_ratio) / std_rs_ratio) * 10
-            rs_momentum_series = (normalized_rs_ratio / normalized_rs_ratio.shift(RRG_LOOKBACK) - 1) * 100 + 100
-            
+            normalized_rs_momentum = 100 + ((rs_momentum_series - mean_rs_mom) / std_rs_mom) * 10
+
             current_ratio = normalized_rs_ratio.iloc[-1]
-            current_momentum = rs_momentum_series.iloc[-1]
+            current_momentum = normalized_rs_momentum.iloc[-1]
 
             if not np.isnan(current_ratio) and not np.isnan(current_momentum):
                 rrg_df.loc[current_date, (asset, 'x')] = current_ratio
@@ -221,7 +226,7 @@ def main():
     if not existing_data:
          final_output = {
             "assets": [
-                {"symbol": symbol, "category": CATEGORY_MAP.get(symbol, "Other")} 
+                {"symbol": symbol, "name": symbol, "category": CATEGORY_MAP.get(symbol, "Other")} 
                 for symbol in price_df.columns if CATEGORY_MAP.get(symbol, "Other") != "Other"
             ],
             "rrg_history": new_snapshots,
