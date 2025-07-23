@@ -122,7 +122,6 @@ def calculate_rrg_and_signals(price_df, start_date=None):
         asset_df = rrg_df[asset].dropna()
         if asset_df.empty: continue
 
-        # Hook Signal Calculation
         is_hook = pd.Series(False, index=asset_df.index)
         if len(asset_df) > HOOK_LOOKBACK_PERIOD:
             for j in range(HOOK_LOOKBACK_PERIOD, len(asset_df)):
@@ -169,11 +168,21 @@ def main():
     
     if os.path.exists(OUTPUT_JSON_PATH):
         print(f"Found existing data file: {OUTPUT_JSON_PATH}")
-        with open(OUTPUT_JSON_PATH, 'r') as f:
-            existing_data = json.load(f)
-        if existing_data.get("rrg_history"):
-            last_processed_date = sorted(existing_data["rrg_history"].keys())[-1]
-            print(f"Last processed date: {last_processed_date}")
+        try:
+            with open(OUTPUT_JSON_PATH, 'r') as f:
+                existing_data = json.load(f)
+            # Health check on the existing JSON file
+            if "assets" not in existing_data or "rrg_history" not in existing_data or "market_breadth" not in existing_data:
+                print("Existing JSON is malformed. Starting a full recalculation.")
+                existing_data = {}
+                last_processed_date = None
+            elif existing_data.get("rrg_history"):
+                last_processed_date = sorted(existing_data["rrg_history"].keys())[-1]
+                print(f"Last processed date: {last_processed_date}")
+        except json.JSONDecodeError:
+            print("Could not parse existing JSON. Starting a full recalculation.")
+            existing_data = {}
+            last_processed_date = None
 
     print("Calculating RRG and signals...")
     rrg_df, signals_df = calculate_rrg_and_signals(price_df, start_date=last_processed_date)
@@ -205,7 +214,7 @@ def main():
         } for date, row in breadth_df.dropna().iterrows()
     }
 
-    if not new_snapshots:
+    if not new_snapshots and existing_data:
         print("No new data to process. Exiting.")
         return
 
@@ -231,4 +240,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
