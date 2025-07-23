@@ -77,7 +77,6 @@ def calculate_rrg_and_signals(price_df, start_date=None):
     """Calculates RRG data and signals for the entire history using the Dynamic Universe approach."""
     all_dates = price_df.index
     
-    # Create a DataFrame to hold all RRG data points (x, y) for all assets
     rrg_df = pd.DataFrame(index=all_dates, columns=pd.MultiIndex.from_product([price_df.columns, ['x', 'y']]))
 
     start_index = MIN_HISTORY_REQUIRED
@@ -118,24 +117,32 @@ def calculate_rrg_and_signals(price_df, start_date=None):
                 rrg_df.loc[current_date, (asset, 'x')] = current_ratio
                 rrg_df.loc[current_date, (asset, 'y')] = current_momentum
 
-    # Calculate signals for all points
     signals_df = pd.DataFrame(index=rrg_df.index, columns=price_df.columns)
     for asset in rrg_df.columns.get_level_values(0).unique():
         asset_df = rrg_df[asset].dropna()
         if asset_df.empty: continue
 
         # Hook Signal Calculation
-        lookback_data = asset_df.rolling(window=HOOK_LOOKBACK_PERIOD + 1).apply(lambda w: w.to_dict(), raw=False)
-        is_hook = lookback_data.apply(lambda w: 
-            w[-1]['x'] > 100 and w[-1]['y'] > 100 and # Condition 3
-            w[0]['x'] > 100 and w[0]['y'] > 100 and # Condition 1
-            any(p['x'] > 100 and p['y'] < 100 for p in w[1:-1]) and # Condition 2
-            w[-1]['y'] > w[0]['y'] and w[-1]['x'] > w[0]['x'] # Condition 4 & 5
-            if isinstance(w, list) and len(w) == HOOK_LOOKBACK_PERIOD + 1 else False
-        )
+        is_hook = pd.Series(False, index=asset_df.index)
+        if len(asset_df) > HOOK_LOOKBACK_PERIOD:
+            for j in range(HOOK_LOOKBACK_PERIOD, len(asset_df)):
+                current_point = asset_df.iloc[j]
+                lookback_point = asset_df.iloc[j - HOOK_LOOKBACK_PERIOD]
+                history_slice = asset_df.iloc[j - HOOK_LOOKBACK_PERIOD : j]
+
+                cond1 = lookback_point['x'] > 100 and lookback_point['y'] > 100
+                cond3 = current_point['x'] > 100 and current_point['y'] > 100
+                if not (cond1 and cond3): continue
+
+                cond2 = (history_slice['y'] < 100).any()
+                if not cond2: continue
+                
+                cond45 = current_point['y'] > lookback_point['y'] and current_point['x'] > lookback_point['x']
+                if cond45:
+                    is_hook.iloc[j] = True
 
         for date, point in asset_df.iterrows():
-            signals_df.loc[date, asset] = get_signal(point, is_hook=is_hook.get(date, False))
+            signals_df.loc[date, asset] = get_signal(point.to_dict(), is_hook=is_hook.get(date, False))
 
     return rrg_df, signals_df
 
@@ -174,10 +181,12 @@ def main():
     print("Calculating market breadth...")
     breadth_df = calculate_market_breadth(signals_df)
 
-    # Convert DataFrames to JSON-friendly format
     new_snapshots = {}
     for date, row in rrg_df.iterrows():
         date_str = date.strftime('%Y-%m-%d')
+        if last_processed_date and date_str <= last_processed_date:
+            continue
+        
         daily_data = {}
         for asset in row.index.get_level_values(0).unique():
             if not pd.isna(row[(asset, 'x')]):
@@ -200,7 +209,6 @@ def main():
         print("No new data to process. Exiting.")
         return
 
-    # Prepare final JSON object
     if not existing_data:
          final_output = {
             "assets": [
@@ -212,7 +220,7 @@ def main():
         }
     else:
         existing_data["rrg_history"].update(new_snapshots)
-        existing_data["market_breadth"] = breadth_history # Overwrite with full history for simplicity
+        existing_data["market_breadth"] = breadth_history
         final_output = existing_data
 
     print(f"Saving updated data to {OUTPUT_JSON_PATH}...")
@@ -223,3 +231,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
