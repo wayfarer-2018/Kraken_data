@@ -9,7 +9,16 @@ CSV_URL = 'https://raw.githubusercontent.com/wayfarer-2018/Kraken_data/main/krak
 OUTPUT_JSON_PATH = 'rrg_data.json'
 RRG_LOOKBACK = 10
 HOOK_LOOKBACK_PERIOD = 12
-MIN_HISTORY_REQUIRED = RRG_LOOKBACK * 2 
+ANALYSIS_START_DATE = '2023-07-20' # The fixed start date for the analysis
+
+# --- BENCHMARK BASKET (45 most established assets from the start date) ---
+BENCHMARK_BASKET = [
+    'AAVE', 'ADA', 'ALGO', 'ATOM', 'AVAX', 'AXS', 'BCH', 'COMP', 'CRV', 'DOGE', 
+    'DOT', 'ENJ', 'EOS', 'ETC', 'ETH', 'FIL', 'FLOW', 'GRT', 'KAVA', 'KSM', 
+    'LDO', 'LINK', 'LPT', 'LRC', 'LTC', 'MANA', 'MATIC', 'MKR', 'NEAR', 'OCEAN', 
+    'REN', 'RUNE', 'SAND', 'SNX', 'SOL', 'SUSHI', 'TRX', 'UNI', 'XLM', 'XMR', 
+    'XRP', 'XTZ', 'YFI', 'ZEC', 'ZRX'
+]
 
 # --- ALIASES AND CATEGORIES ---
 TICKER_ALIAS_MAP = {
@@ -70,59 +79,43 @@ def get_signal(point, is_hook=False):
     if point['x'] < 100 and point['y'] > 100: return 'BUY'
     return 'SELL'
 
-def calculate_rrg_and_signals(price_df, start_date=None):
-    """Calculates RRG data and signals for the entire history using the Dynamic Universe approach."""
+def calculate_rrg_and_signals(price_df):
+    """Calculates RRG data and signals using a stable benchmark basket."""
+    
+    # Filter the main price dataframe to start from the analysis date
+    price_df = price_df[price_df.index >= pd.to_datetime(ANALYSIS_START_DATE)]
     all_dates = price_df.index
     
+    # Create the stable benchmark series
+    benchmark_df = price_df[BENCHMARK_BASKET]
+    benchmark = benchmark_df.mean(axis=1)
+
+    # DataFrames to hold the final calculated values
     rrg_df = pd.DataFrame(index=all_dates, columns=pd.MultiIndex.from_product([price_df.columns, ['x', 'y']]))
+    signals_df = pd.DataFrame(index=all_dates, columns=price_df.columns)
 
-    start_index = MIN_HISTORY_REQUIRED
-    if start_date:
-        try:
-            start_index = all_dates.get_loc(start_date) + 1
-        except KeyError:
-            start_index = MIN_HISTORY_REQUIRED
-
-    print(f"Starting RRG calculation from index {start_index}...")
-
-    for i in range(start_index, len(all_dates)):
-        current_date = all_dates[i]
-        history_start_date = all_dates[i - MIN_HISTORY_REQUIRED]
+    print("Calculating RRG values for all assets...")
+    for asset in price_df.columns:
+        rs = price_df[asset] / benchmark
         
-        historical_window = price_df.loc[history_start_date:current_date]
-        valid_assets = historical_window.dropna(axis=1).columns
+        rs_ratio_series = rs.rolling(window=RRG_LOOKBACK).mean()
+        rs_momentum_series = (rs / rs.shift(RRG_LOOKBACK) - 1) * 100
         
-        if len(valid_assets) < 2: continue
+        mean_rs_ratio = rs_ratio_series.mean()
+        std_rs_ratio = rs_ratio_series.std()
+        if std_rs_ratio == 0: continue
 
-        benchmark = historical_window[valid_assets].mean(axis=1)
-        
-        for asset in valid_assets:
-            rs = historical_window[asset] / benchmark
-            
-            # CORRECTED LOGIC: Calculate Ratio and Momentum from raw RS
-            rs_ratio_series = rs.rolling(window=RRG_LOOKBACK).mean()
-            rs_momentum_series = (rs / rs.shift(RRG_LOOKBACK) - 1) * 100
-            
-            # Normalize both series independently
-            mean_rs_ratio = rs_ratio_series.mean()
-            std_rs_ratio = rs_ratio_series.std()
-            if std_rs_ratio == 0: continue
+        mean_rs_mom = rs_momentum_series.mean()
+        std_rs_mom = rs_momentum_series.std()
+        if std_rs_mom == 0: continue
 
-            mean_rs_mom = rs_momentum_series.mean()
-            std_rs_mom = rs_momentum_series.std()
-            if std_rs_mom == 0: continue
+        normalized_rs_ratio = 100 + ((rs_ratio_series - mean_rs_ratio) / std_rs_ratio) * 10
+        normalized_rs_momentum = 100 + ((rs_momentum_series - mean_rs_mom) / std_rs_mom) * 10
 
-            normalized_rs_ratio = 100 + ((rs_ratio_series - mean_rs_ratio) / std_rs_ratio) * 10
-            normalized_rs_momentum = 100 + ((rs_momentum_series - mean_rs_mom) / std_rs_mom) * 10
+        rrg_df[(asset, 'x')] = normalized_rs_ratio
+        rrg_df[(asset, 'y')] = normalized_rs_momentum
 
-            current_ratio = normalized_rs_ratio.iloc[-1]
-            current_momentum = normalized_rs_momentum.iloc[-1]
-
-            if not np.isnan(current_ratio) and not np.isnan(current_momentum):
-                rrg_df.loc[current_date, (asset, 'x')] = current_ratio
-                rrg_df.loc[current_date, (asset, 'y')] = current_momentum
-
-    signals_df = pd.DataFrame(index=rrg_df.index, columns=price_df.columns)
+    print("Calculating signals...")
     for asset in rrg_df.columns.get_level_values(0).unique():
         asset_df = rrg_df[asset].dropna()
         if asset_df.empty: continue
@@ -168,39 +161,15 @@ def main():
     print("Loading and cleaning data...")
     price_df = load_and_clean_data(CSV_URL)
     
-    existing_data = {}
-    last_processed_date = None
-    
-    if os.path.exists(OUTPUT_JSON_PATH):
-        print(f"Found existing data file: {OUTPUT_JSON_PATH}")
-        try:
-            with open(OUTPUT_JSON_PATH, 'r') as f:
-                existing_data = json.load(f)
-            # Health check on the existing JSON file
-            if "assets" not in existing_data or "rrg_history" not in existing_data or "market_breadth" not in existing_data:
-                print("Existing JSON is malformed. Starting a full recalculation.")
-                existing_data = {}
-                last_processed_date = None
-            elif existing_data.get("rrg_history"):
-                last_processed_date = sorted(existing_data["rrg_history"].keys())[-1]
-                print(f"Last processed date: {last_processed_date}")
-        except json.JSONDecodeError:
-            print("Could not parse existing JSON. Starting a full recalculation.")
-            existing_data = {}
-            last_processed_date = None
-
     print("Calculating RRG and signals...")
-    rrg_df, signals_df = calculate_rrg_and_signals(price_df, start_date=last_processed_date)
+    rrg_df, signals_df = calculate_rrg_and_signals(price_df)
 
     print("Calculating market breadth...")
     breadth_df = calculate_market_breadth(signals_df)
 
-    new_snapshots = {}
+    rrg_history = {}
     for date, row in rrg_df.iterrows():
         date_str = date.strftime('%Y-%m-%d')
-        if last_processed_date and date_str <= last_processed_date:
-            continue
-        
         daily_data = {}
         for asset in row.index.get_level_values(0).unique():
             if not pd.isna(row[(asset, 'x')]):
@@ -210,7 +179,7 @@ def main():
                     'signal': signals_df.loc[date, asset]
                 }
         if daily_data:
-            new_snapshots[date_str] = daily_data
+            rrg_history[date_str] = daily_data
 
     breadth_history = {
         date.strftime('%Y-%m-%d'): {
@@ -219,23 +188,14 @@ def main():
         } for date, row in breadth_df.dropna().iterrows()
     }
 
-    if not new_snapshots and existing_data:
-        print("No new data to process. Exiting.")
-        return
-
-    if not existing_data:
-         final_output = {
-            "assets": [
-                {"symbol": symbol, "name": symbol, "category": CATEGORY_MAP.get(symbol, "Other")} 
-                for symbol in price_df.columns if CATEGORY_MAP.get(symbol, "Other") != "Other"
-            ],
-            "rrg_history": new_snapshots,
-            "market_breadth": breadth_history
-        }
-    else:
-        existing_data["rrg_history"].update(new_snapshots)
-        existing_data["market_breadth"] = breadth_history
-        final_output = existing_data
+    final_output = {
+        "assets": [
+            {"symbol": symbol, "name": symbol, "category": CATEGORY_MAP.get(symbol, "Other")} 
+            for symbol in price_df.columns if CATEGORY_MAP.get(symbol, "Other") != "Other"
+        ],
+        "rrg_history": rrg_history,
+        "market_breadth": breadth_history
+    }
 
     print(f"Saving updated data to {OUTPUT_JSON_PATH}...")
     with open(OUTPUT_JSON_PATH, 'w') as f:
